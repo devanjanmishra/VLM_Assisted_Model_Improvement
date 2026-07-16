@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: "VLM backend (ollama | anthropic)"
+        default: "anthropic"
+        required: false
+      limit_vlm:
+        description: "Max VLM calls (cost cap)"
+        default: "300"
+        required: false
+
+jobs:
+  # ── fast: lint + unit tests, no GPU ────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt ruff pytest
+      - run: ruff check pipeline/ tests/
+      - run: pytest tests/ -v --tb=short
+
+  # ── smoke: mini dataset, mocked VLM, CPU ───────────────────────────────────
+  smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python pipeline/prepare_data.py --max-per-class 80
+      - run: python pipeline/train.py --head-epochs 1 --ft-epochs 1 --workers 0
+      - run: python pipeline/flag.py --workers 0
+      - run: python tests/inject_pseudo_labels.py   # simulates VLM output, no API call
+      - run: python pipeline/finetune.py --epochs 1 --workers 0
+      - run: python pipeline/evaluate.py --workers 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.run_number }}
+          path: outputs/eval_report.json
+
+  # ── full: real VLM, manual trigger only ────────────────────────────────────
+  full:
+    needs: smoke
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: |
+          python pipeline/run_pipeline.py \
+            --skip-data \
+            --backend ${{ github.event.inputs.backend }} \
+            --limit-vlm ${{ github.event.inputs.limit_vlm }} \
+            --workers 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-${{ github.run_number }}
+          path: |
+            outputs/eval_report.json
+            outputs/pseudo_labels.csv
+            checkpoints/promoted.pt
